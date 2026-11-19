@@ -1,0 +1,186 @@
+name: streamforge
+
+# Local development stack. Credentials below are development-only defaults.
+# Do NOT expose these ports or reuse these credentials in any public deployment.
+
+x-flink-env: &flink-env
+  KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  CLICKHOUSE_URL: http://clickhouse:8123
+  CLICKHOUSE_USER: ${CLICKHOUSE_USER:-streamforge}
+  CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-streamforge-dev}
+  FLINK_PARALLELISM: ${FLINK_PARALLELISM:-2}
+  FLINK_PROPERTIES: |
+    jobmanager.rpc.address: flink-jobmanager
+    rest.address: flink-jobmanager
+    rest.bind-address: 0.0.0.0
+    state.checkpoints.dir: file:///flink-state/checkpoints
+    state.backend.type: hashmap
+
+services:
+  kafka:
+    image: apache/kafka:3.9.0
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: INTERNAL://:9092,CONTROLLER://:9093,EXTERNAL://:29092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_HEAP_OPTS: -Xms256m -Xmx512m
+    ports:
+      - "127.0.0.1:29092:29092"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 15s
+    mem_limit: 900m
+    stop_grace_period: 30s
+
+  kafka-init:
+    image: apache/kafka:3.9.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        B=kafka:9092
+        K=/opt/kafka/bin/kafka-topics.sh
+        $$K --bootstrap-server $$B --create --if-not-exists --topic events.raw.v1 --partitions 3 --replication-factor 1 --config retention.ms=604800000
+        $$K --bootstrap-server $$B --create --if-not-exists --topic events.analytics.v1 --partitions 3 --replication-factor 1
+        $$K --bootstrap-server $$B --create --if-not-exists --topic events.dlq.v1 --partitions 1 --replication-factor 1 --config retention.ms=1209600000
+        $$K --bootstrap-server $$B --list
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    environment:
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-streamforge}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-streamforge-dev}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    ports:
+      - "127.0.0.1:8123:8123"
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - ./infrastructure/clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8123/ping | grep -q Ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    mem_limit: 1500m
+
+  flink-jobmanager:
+    build: ./streaming/flink-job
+    image: streamforge/flink-job:local
+    command: jobmanager
+    environment: *flink-env
+    ports:
+      - "127.0.0.1:8081:8081"
+    volumes:
+      - flink-state:/flink-state
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/localhost/8081'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    mem_limit: 1100m
+
+  flink-taskmanager:
+    image: streamforge/flink-job:local
+    command: taskmanager
+    depends_on:
+      flink-jobmanager:
+        condition: service_healthy
+    environment:
+      <<: *flink-env
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        state.checkpoints.dir: file:///flink-state/checkpoints
+        state.backend.type: hashmap
+        taskmanager.numberOfTaskSlots: 2
+        taskmanager.memory.process.size: 1500m
+    volumes:
+      - flink-state:/flink-state
+    mem_limit: 1600m
+    restart: unless-stopped
+
+  flink-job-submit:
+    image: streamforge/flink-job:local
+    depends_on:
+      flink-jobmanager:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      clickhouse:
+        condition: service_healthy
+    environment: *flink-env
+    restart: "no"
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        for i in $$(seq 1 30); do
+          if flink list -m flink-jobmanager:8081 -r 2>/dev/null | grep -q "StreamForge"; then echo "job already running"; exit 0; fi
+          if flink run -m flink-jobmanager:8081 -d /opt/flink/usrlib/job.jar; then exit 0; fi
+          echo "submit attempt $$i failed, retrying"; sleep 5
+        done
+        exit 1
+
+  api:
+    build: ./backend/api
+    image: streamforge/api:local
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      clickhouse:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-streamforge}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-streamforge-dev}
+      FLINK_REST_URL: http://flink-jobmanager:8081
+      CORS_ALLOWED_ORIGINS: http://localhost:3000,http://localhost:5173
+      JAVA_TOOL_OPTIONS: -Xms128m -Xmx384m
+    ports:
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/localhost/8080; printf \"GET /api/v1/health HTTP/1.0\\r\\n\\r\\n\" >&3; grep -q \"200\" <&3'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 25s
+    mem_limit: 700m
+    stop_grace_period: 20s
+
+  frontend:
+    build: ./frontend
+    image: streamforge/frontend:local
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:3000:80"
+    mem_limit: 64m
+
+volumes:
+  kafka-data:
+  clickhouse-data:
+  flink-state:

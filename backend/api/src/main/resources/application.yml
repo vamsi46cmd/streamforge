@@ -1,0 +1,68 @@
+server:
+  port: 8080
+  shutdown: graceful
+
+spring:
+  application:
+    name: streamforge-api
+  lifecycle:
+    timeout-per-shutdown-phase: 15s
+  jackson:
+    default-property-inclusion: non_null
+    deserialization:
+      use-big-decimal-for-floats: true
+    serialization:
+      write-bigdecimal-as-plain: true
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:29092}
+    producer:
+      acks: all
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      properties:
+        enable.idempotence: true
+        retries: 5
+        retry.backoff.ms: 200
+        retry.backoff.max.ms: 1000
+        delivery.timeout.ms: 8000
+        request.timeout.ms: 4000
+        max.block.ms: 3000
+        linger.ms: 5
+
+streamforge:
+  topics:
+    raw: events.raw.v1
+  kafka:
+    flink-group: streamforge-flink
+    publish-timeout-ms: 9000
+  clickhouse:
+    url: ${CLICKHOUSE_URL:http://localhost:8123}
+    user: ${CLICKHOUSE_USER:streamforge}
+    password: ${CLICKHOUSE_PASSWORD:streamforge-dev}
+  flink:
+    rest-url: ${FLINK_REST_URL:http://localhost:8081}
+  cors:
+    allowed-origins: ${CORS_ALLOWED_ORIGINS:http://localhost:3000,http://localhost:5173}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus,info
+  endpoint:
+    health:
+      probes:
+        enabled: true
+  health:
+    kafka:
+      enabled: false
+
+springdoc:
+  api-docs:
+    path: /api/v1/openapi
+  swagger-ui:
+    path: /api/v1/docs
+
+logging:
+  pattern:
+    level: "%5p [%X{correlationId:-}]"
